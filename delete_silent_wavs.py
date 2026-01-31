@@ -5,9 +5,7 @@ Files are sent to the Recycle Bin, not permanently deleted.
 """
 
 import os
-import sys
 import wave
-import struct
 
 try:
     from send2trash import send2trash
@@ -16,36 +14,17 @@ except ImportError:
     HAS_SEND2TRASH = False
 
 
-def get_peak_amplitude(audio_data, sample_width):
-    """Get the peak (maximum absolute) amplitude of audio data."""
-    if len(audio_data) == 0:
-        return 0
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks for fast reading
 
-    # Determine format based on sample width
-    if sample_width == 1:
-        fmt = f"{len(audio_data)}B"  # unsigned 8-bit
-        samples = struct.unpack(fmt, audio_data)
-        samples = [abs(s - 128) for s in samples]  # convert to signed, take abs
-    elif sample_width == 2:
-        fmt = f"{len(audio_data) // 2}h"  # signed 16-bit
-        samples = [abs(s) for s in struct.unpack(fmt, audio_data)]
-    elif sample_width == 4:
-        fmt = f"{len(audio_data) // 4}i"  # signed 32-bit
-        samples = [abs(s) for s in struct.unpack(fmt, audio_data)]
-    else:
-        return -1  # unsupported format
-
-    if len(samples) == 0:
-        return 0
-
-    return max(samples)
+# Pre-compute zero bytes for comparison
+ZERO_CHUNK = bytes(CHUNK_SIZE)
 
 
 def is_empty_wav(filepath):
     """
     Check if a WAV file contains only true silence (all zeros).
 
-    Only returns True if the file has no audio frames OR all samples are exactly zero.
+    Optimized: reads in chunks and exits early on first non-zero byte.
 
     Returns:
         True if the file is empty/silent, False otherwise
@@ -59,17 +38,41 @@ def is_empty_wav(filepath):
             if n_frames == 0:
                 return True
 
+            n_channels = wav.getnchannels()
             sample_width = wav.getsampwidth()
-            audio_data = wav.readframes(n_frames)
+            total_bytes = n_frames * n_channels * sample_width
 
-            peak = get_peak_amplitude(audio_data, sample_width)
+            # For 8-bit audio, silence is 128 (0x80), not 0
+            is_8bit = (sample_width == 1)
 
-            if peak < 0:
-                print(f"  Warning: Unsupported sample width ({sample_width} bytes) in {filepath}")
-                return None
+            # Read in chunks for speed and memory efficiency
+            bytes_read = 0
+            while bytes_read < total_bytes:
+                chunk_frames = min(CHUNK_SIZE // (n_channels * sample_width), n_frames - (bytes_read // (n_channels * sample_width)))
+                if chunk_frames <= 0:
+                    break
 
-            # Only consider empty if peak amplitude is exactly 0
-            return peak == 0
+                chunk = wav.readframes(chunk_frames)
+                if not chunk:
+                    break
+
+                if is_8bit:
+                    # For 8-bit, check if all bytes are 128 (silence)
+                    if any(b != 128 for b in chunk):
+                        return False
+                else:
+                    # For 16-bit and higher, check if all bytes are zero
+                    # Fast check: compare against zero bytes
+                    if len(chunk) == CHUNK_SIZE:
+                        if chunk != ZERO_CHUNK:
+                            return False
+                    else:
+                        if any(b != 0 for b in chunk):
+                            return False
+
+                bytes_read += len(chunk)
+
+            return True
 
     except wave.Error as e:
         print(f"  Error reading {filepath}: {e}")
@@ -85,7 +88,7 @@ def main():
     print("=" * 60)
     print()
     print("- Deletes WAV files with TRUE silence (all samples = 0)")
-    print("- Renames files ending in '_Master' to remove the suffix")
+    print("- Renames files ending in '_Master' to '__FULLMIX'")
     print()
 
     # Get current directory
@@ -151,7 +154,7 @@ def main():
     if master_files:
         print(f"Found {len(master_files)} file(s) with '_Master' suffix to rename:")
         for f in master_files:
-            new_name = f[:-11] + ".wav"  # Remove _Master.wav, add .wav
+            new_name = f[:-11] + "__FULLMIX.wav"  # Replace _Master with __FULLMIX
             print(f"  - {f} -> {new_name}")
         print()
 
@@ -184,7 +187,7 @@ def main():
     if master_files:
         for filename in master_files:
             try:
-                new_name = filename[:-11] + ".wav"  # Remove _Master.wav, add .wav
+                new_name = filename[:-11] + "__FULLMIX.wav"  # Replace _Master with __FULLMIX
                 old_path = os.path.join(current_dir, filename)
                 new_path = os.path.join(current_dir, new_name)
 
